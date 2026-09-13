@@ -13,6 +13,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use url::Url;
+use futures::stream::{self, Stream, StreamExt};
 
 /// The default FRED API base URL.
 pub const FRED_BASE_URL: &str = "https://api.stlouisfed.org/fred/";
@@ -492,6 +493,65 @@ impl<'a> SeriesApi<'a> {
             .await?
             .observations)
     }
+
+
+    /// Fetches observations across a wide realtime window, automatically splitting
+    /// the request into vintage-safe sub-windows to stay under FRED's documented
+    /// 2000-vintage-date limit per request. Yields one page per sub-window.
+    ///
+    /// `params.realtime` is used as the overall window to cover; if unset, defaults
+    /// to FRED's full history sentinel (1776-07-04) through today.
+    pub fn observations_windowed(
+        &'a self,
+        params: Observations,
+        window_years: u32,
+    ) -> impl Stream<Item = Result<Vec<Observation>, FredError>> + 'a {
+        let today = chrono::Local::now().date_naive();
+
+        let start = params
+            .realtime
+            .start
+            .unwrap_or_else(|| NaiveDate::from_ymd_opt(1776, 7, 4).unwrap());
+
+        // FRED هر realtime_end ای بعد از امروز رو رد می‌کنه، مگر دقیقاً برابر sentinel
+        // (9999-12-31) باشه. چون هیچ‌وقت داده‌ای بعد از امروز وجود نداره، کلمپ‌کردن
+        // اینجا به "امروز" هیچ داده‌ای رو حذف نمی‌کنه — فقط از تولید پنجره‌های
+        // نامعتبر (بین امروز و sentinel) جلوگیری می‌کنه.
+        let end = params
+            .realtime
+            .end
+            .unwrap_or(today)
+            .min(today);
+
+        let windows = split_realtime_window(start, end, window_years);
+
+        stream::iter(windows).then(move |(window_start, window_end)| {
+            let mut p = params.clone();
+            p.realtime = Realtime {
+                start: Some(window_start),
+                end: Some(window_end),
+            };
+            async move {
+                match self.observations(p.clone()).await {
+                    Err(FredError::Api(ref e)) if is_no_vintage_data_before_window(e) => Ok(vec![]),
+                    Err(FredError::Api(ref e)) => match extract_servers_today_from_error(e) {
+                        Some(servers_today) => {
+                            let mut retry = p.clone();
+                            retry.realtime.end = Some(servers_today.min(window_end));
+                            match self.observations(retry).await {
+                                Err(FredError::Api(ref e2)) if is_no_vintage_data_before_window(e2) => Ok(vec![]),
+                                other => other,
+                            }
+                        }
+                        None => Err(FredError::Api(e.clone())),
+                    },
+                    other => other,
+                }
+            }
+        })
+    }
+
+
     /// Searches the FRED series catalogue.
     pub async fn search(&self, p: Search) -> Result<Vec<Series>, FredError> {
         let mut q = Query::default();
@@ -726,9 +786,56 @@ impl<'a> GeoFredApi<'a> {
     }
 }
 
+/// Splits `[start, end]` into consecutive, non-overlapping sub-ranges of at most
+/// `years` years each. The last sub-range may be shorter.
+fn split_realtime_window(start: NaiveDate, end: NaiveDate, years: u32) -> Vec<(NaiveDate, NaiveDate)> {
+    let years = years.max(1); // جلوگیری از حلقه‌ی بی‌نهایت اگه صفر پاس داده بشه
+    let mut windows = Vec::new();
+    let mut window_start = start;
+
+    while window_start <= end {
+        let window_end = window_start
+            .checked_add_months(chrono::Months::new(years * 12))
+            .and_then(|d| d.pred_opt())
+            .unwrap_or(end)
+            .min(end);
+
+        windows.push((window_start, window_end));
+
+        match window_end.succ_opt() {
+            Some(next) => window_start = next,
+            None => break,
+        }
+    }
+
+    windows
+}
+
+fn is_no_vintage_data_before_window(error: &FredApiError) -> bool {
+    error.error_code == 400
+        && error
+            .error_message
+            .contains("does not exist in ALFRED but may exist in FRED")
+}
+
+
+fn extract_servers_today_from_error(error: &FredApiError) -> Option<NaiveDate> {
+    // پیغام همیشه به این شکله:
+    // "... can not be after today's date (YYYY-MM-DD) unless ..."
+    let marker = "today's date (";
+    let start = error.error_message.find(marker)? + marker.len();
+    let end = error.error_message[start..].find(')')? + start;
+    NaiveDate::parse_from_str(&error.error_message[start..end], "%Y-%m-%d").ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+
+use futures::pin_mut;
+use serde_json::Value;
+
+use super::*;
     #[test]
     fn missing_observation_is_none() {
         let o:Observation=serde_json::from_str(r#"{"realtime_start":"2020-01-01","realtime_end":"2020-01-01","date":"2020-01-01","value":"."}"#).unwrap();
@@ -739,4 +846,275 @@ mod tests {
         let o:Observation=serde_json::from_str(r#"{"realtime_start":"2020-01-01","realtime_end":"2020-01-01","date":"2020-01-01","value":"12.5"}"#).unwrap();
         assert_eq!(o.value, Some(12.5))
     }
+
+    #[tokio::test]
+    async fn inspect_fred_observation_dates() {
+        let api_key = keyring::Entry::new(
+        "macro-economics",
+        "FRED_API_KEY",
+        )
+        .unwrap()
+        .get_password()
+        .unwrap();
+
+        let url = "https://api.stlouisfed.org/fred/series/observations";
+
+        let response = Client::new()
+            .get(url)
+            .query(&[
+                ("api_key", api_key.as_str()),
+                ("file_type", "json"),
+                ("series_id", "CPIAUCSL"),
+                ("realtime_start", "2026-01-01"),
+                ("realtime_end", "2026-03-01"),
+                ("limit", "1"),
+            ])
+            .send()
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response.text().await.unwrap();
+
+        assert!(status.is_success(), "FRED returned {status}: {body}");
+
+        let json: Value = serde_json::from_str(&body).unwrap();
+
+        let observation = &json["observations"][0];
+
+        println!("RAW FRED observation:");
+        println!("{}", serde_json::to_string_pretty(observation).unwrap());
+
+        println!("date           = {:?}", observation["date"]);
+        println!("realtime_start = {:?}", observation["realtime_start"]);
+        println!("realtime_end   = {:?}", observation["realtime_end"]);
+    }
+
+
+    #[tokio::test]
+    async fn inspect_fred_all_revisions() {
+        let api_key = keyring::Entry::new("macro-economics", "FRED_API_KEY")
+            .unwrap()
+            .get_password()
+            .unwrap();
+
+        let url = "https://api.stlouisfed.org/fred/series/observations";
+        let client = Client::new();
+
+        let mut offset = 0u64;
+        let limit = 100_000u64; // FRED's max per request
+        let mut all_observations = Vec::new();
+
+        loop {
+            let response = client
+                .get(url)
+                .query(&[
+                    ("api_key", api_key.as_str()),
+                    ("file_type", "json"),
+                    ("series_id", "CPIAUCSL"),
+                    ("realtime_start", "1776-07-04"),  // FRED's "earliest" sentinel
+                    ("realtime_end", "9999-12-31"),     // FRED's "latest" sentinel
+                    ("output_type", "2"),               // all vintages, incl. revisions
+                    ("limit", &limit.to_string()),
+                    ("offset", &offset.to_string()),
+                ])
+                .send()
+                .await
+                .unwrap();
+
+            let body = response.text().await.unwrap();
+            let json: Value = serde_json::from_str(&body).unwrap();
+
+            let batch = json["observations"].as_array().unwrap().clone();
+            let count = batch.len();
+            all_observations.extend(batch);
+
+            println!("fetched {count} rows at offset {offset}");
+
+            if count < limit as usize {
+                break; // last page
+            }
+            offset += limit;
+        }
+
+        println!("total rows (all obs dates, all revisions): {}", all_observations.len());
+
+        // peek at a few
+        for obs in all_observations.iter().take(5) {
+            println!(
+                "date={} value={:<10} realtime_start={} realtime_end={}",
+                obs["date"], obs["value"], obs["realtime_start"], obs["realtime_end"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_fred_all_revisions_ver2() {
+        let api_key = keyring::Entry::new("macro-economics", "FRED_API_KEY")
+            .unwrap()
+            .get_password()
+            .unwrap();
+
+        let url = "https://api.stlouisfed.org/fred/series/observations";
+        let client = Client::new();
+
+        let mut offset = 0u64;
+        let limit = 100_000u64; // FRED's max per request
+        let mut all_observations = Vec::new();
+
+        loop {
+            let response = client
+                .get(url)
+                .query(&[
+                    ("api_key", api_key.as_str()),
+                    ("file_type", "json"),
+                    ("series_id", "CPIAUCSL"),
+                    ("realtime_start", "1776-07-04"), // widen real-time window
+                    ("realtime_end", "9999-12-31"),    // to catch every vintage
+                    // no output_type -> defaults to 1 (flat, per-vintage rows)
+                    // no observation_start/end -> defaults to full history
+                    ("limit", &limit.to_string()),
+                    ("offset", &offset.to_string()),
+                ])
+                .send()
+                .await
+                .unwrap();
+
+            let body = response.text().await.unwrap();
+            let json: Value = serde_json::from_str(&body).unwrap();
+
+            let batch = json["observations"].as_array().unwrap().clone();
+            let count = batch.len();
+            all_observations.extend(batch);
+
+            println!("fetched {count} rows at offset {offset}, total count={}", json["count"]);
+
+            if count < limit as usize {
+                break;
+            }
+            offset += limit;
+        }
+
+        println!("total rows (all dates, all revisions): {}", all_observations.len());
+
+        for obs in all_observations.iter().take(5) {
+            println!(
+                "date={} value={:<10} realtime_start={} realtime_end={}",
+                obs["date"], obs["value"], obs["realtime_start"], obs["realtime_end"]
+            );
+        }
+
+        let mut by_date: HashMap<String, Vec<&Value>> = HashMap::new();
+        for obs in &all_observations {
+            let date = obs["date"].as_str().unwrap().to_string();
+            by_date.entry(date).or_default().push(obs);
+        }
+        // find dates that have more than one vintage (i.e. were revised)
+        let mut revised: Vec<_> = by_date.iter().filter(|(_, v)| v.len() > 1).collect();
+        revised.sort_by_key(|(_, v)| std::cmp::Reverse(v.len())); // most-revised first
+
+        println!("unique observation dates: {}", by_date.len());
+        println!("dates with at least one revision: {}", revised.len());
+
+        // print the most-revised date as an example
+        if let Some((date, versions)) = revised.first() {
+            println!("\nmost-revised date: {date} ({} vintages)", versions.len());
+            for obs in versions.iter() {
+                println!(
+                    "  value={:<10} realtime_start={} realtime_end={}",
+                    obs["value"], obs["realtime_start"], obs["realtime_end"]
+                );
+            }
+        }
+    }
+
+
+    #[test]
+    fn splits_into_non_overlapping_windows() {
+        let start = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2012, 6, 15).unwrap();
+        let windows = split_realtime_window(start, end, 5);
+
+        assert_eq!(windows[0], (start, NaiveDate::from_ymd_opt(2004, 12, 31).unwrap()));
+        assert_eq!(windows[1].0, NaiveDate::from_ymd_opt(2005, 1, 1).unwrap());
+        assert_eq!(*windows.last().unwrap(), (windows.last().unwrap().0, end));
+
+        // هیچ دو تا window ای نباید هم‌پوشانی داشته باشن
+        for pair in windows.windows(2) {
+            assert!(pair[0].1 < pair[1].0);
+        }
+    }
+
+    #[tokio::test]
+    async fn observations_windowed_splits_huge_date_range() {
+        let api_key = keyring::Entry::new("macro-economics", "FRED_API_KEY")
+            .unwrap()
+            .get_password()
+            .unwrap();
+
+        let client = FredClient::new(api_key).unwrap();
+
+        let mut params = Observations::new("DGS10");
+        params.realtime = Realtime {
+            start: NaiveDate::from_ymd_opt(1776, 7, 4),
+            end: Some(NaiveDate::from_ymd_opt(9999, 12, 31).unwrap()),
+        };
+
+        // هر تکه ۵ ساله — همون پارامتری که قبلاً برای split_realtime_window طراحی کردیم
+        let series_api = client.series();
+        let stream = series_api.observations_windowed(params, 5);
+
+        pin_mut!(stream);
+
+        let mut window_index = 0u32;
+        let mut total_observations = 0usize;
+
+        while let Some(result) = stream.next().await {
+            window_index += 1;
+            match result {
+                Ok(batch) => {
+                    println!("window {window_index}: {} observations", batch.len());
+                    if let (Some(first), Some(last)) = (batch.first(), batch.last()) {
+                        println!("  from {} to {}", first.date, last.date);
+                    }
+                    total_observations += batch.len();
+                }
+                // اگه اینجا panic بشه، یعنی splitting واقعاً کار نکرده و
+                // یکی از تکه‌ها هنوز به سقف vintage date خورده
+                Err(e) => panic!("window {window_index} failed: {e}"),
+            }
+        }
+
+        println!("total windows fetched: {window_index}");
+        println!("total observations across all windows: {total_observations}");
+
+        // با یه بازه‌ی این‌قدر بزرگ، باید حتماً چندین تکه ساخته بشه، نه یکی
+        assert!(
+            window_index > 1,
+            "a huge date range should be split into multiple windows"
+        );
+        assert!(total_observations > 0, "DGS10 should have real observations");
+    }
+
+    #[test]
+    fn extracts_date_from_realtime_end_error() {
+        let error = FredApiError {
+            error_code: 400,
+            error_message: "Bad Request.  Variable realtime_end can not be after today's date (2026-09-12) unless it's equal to the real-time max date 9999-12-31.".to_string(),
+        };
+        assert_eq!(
+            extract_servers_today_from_error(&error),
+            Some(NaiveDate::from_ymd_opt(2026, 9, 12).unwrap())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_unrelated_error() {
+        let error = FredApiError {
+            error_code: 400,
+            error_message: "Bad Request. Some other error.".to_string(),
+        };
+        assert_eq!(extract_servers_today_from_error(&error), None);
+    }
+
 }
