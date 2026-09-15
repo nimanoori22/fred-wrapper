@@ -15,6 +15,8 @@ use thiserror::Error;
 use url::Url;
 use futures::stream::{self, Stream, StreamExt};
 
+pub mod queue;
+
 /// The default FRED API base URL.
 pub const FRED_BASE_URL: &str = "https://api.stlouisfed.org/fred/";
 /// The GeoFRED API base URL.
@@ -92,13 +94,15 @@ impl FredClient {
             &self.fred_base
         })
         .join(endpoint)?;
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("api_key", &self.api_key);
-        pairs.append_pair("file_type", "json");
-        for (key, value) in query.0 {
-            pairs.append_pair(&key, &value);
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("api_key", &self.api_key);
+            pairs.append_pair("file_type", "json");
+            for (key, value) in query.0 {
+                pairs.append_pair(&key, &value);
+            }
+        // drop(pairs);
         }
-        drop(pairs);
         let response = self
             .http
             .get(url)
@@ -146,6 +150,8 @@ pub enum FredError {
     Decode(#[source] serde_json::Error),
     #[error("FRED returned no {resource} records for a request that requires one")]
     EmptyResponse { resource: &'static str },
+    #[error("the request queue is closed")]
+    Unavailable(String),
 }
 
 /// Error body returned by FRED for invalid API requests.
