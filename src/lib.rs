@@ -9,11 +9,14 @@
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
+use futures::stream::{self, Stream, StreamExt};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{Duration, Instant, sleep};
 use url::Url;
-use futures::stream::{self, Stream, StreamExt};
 
 pub mod queue;
 
@@ -21,39 +24,121 @@ pub mod queue;
 pub const FRED_BASE_URL: &str = "https://api.stlouisfed.org/fred/";
 /// The GeoFRED API base URL.
 pub const GEOFRED_BASE_URL: &str = "https://api.stlouisfed.org/geofred/";
+/// The number of concurrent requests to allow within each window.
+pub const WINDOW_CONCURRENCY: usize = 4;
+
+#[derive(Clone, Debug)]
+pub struct FredResilienceConfig {
+    /// Maximum number of request attempts allowed during each one-second window.
+    pub requests_per_second: u32,
+    /// Number of additional attempts after an initial failed request.
+    ///
+    /// For example, `max_retries: 2` permits at most three total attempts.
+    pub max_retries: u32,
+    /// Delay before the first retry; later delays double, up to [`Self::max_backoff`].
+    pub initial_backoff: Duration,
+    /// Upper bound for an exponential retry delay.
+    pub max_backoff: Duration,
+    /// Longest time a request may wait for a rate-limit permit before it is rejected.
+    pub rate_limit_timeout: Duration,
+}
+
+impl Default for FredResilienceConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_second: 2,
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(10),
+            rate_limit_timeout: Duration::from_millis(300),
+        }
+    }
+}
+
+/// Ensures at most `requests_per_second` HTTP requests are sent, across all
+/// clones of the `FredClient` that share this state (via `Arc`).
+#[derive(Clone)]
+struct RateLimiterState {
+    last_request: Arc<AsyncMutex<Instant>>,
+    min_interval: Duration,
+}
+
+impl RateLimiterState {
+    fn new(requests_per_second: u32) -> Self {
+        let min_interval = if requests_per_second == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(1.0 / requests_per_second as f64)
+        };
+        Self {
+            last_request: Arc::new(AsyncMutex::new(Instant::now() - min_interval)),
+            min_interval,
+        }
+    }
+
+    /// Blocks until enough time has passed since the last request to stay
+    /// under the configured rate.
+    async fn wait_turn(&self) {
+        let mut last = self.last_request.lock().await;
+        let now = Instant::now();
+        let earliest_next = *last + self.min_interval;
+        if earliest_next > now {
+            sleep(earliest_next - now).await;
+        }
+        *last = Instant::now();
+    }
+}
 
 /// An asynchronous FRED/ALFRED API client.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FredClient {
-    http: Client,
+    http: reqwest::Client,
     api_key: String,
     fred_base: Url,
     geofred_base: Url,
+    resilience: FredResilienceConfig,
+    rate_limiter: RateLimiterState,
+}
+
+impl std::fmt::Debug for FredClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FredClient")
+            .field("api_key", &"<redacted>")
+            .field("fred_base", &self.fred_base)
+            .field("geofred_base", &self.geofred_base)
+            .finish()
+    }
 }
 
 impl FredClient {
     /// Creates a client with the production FRED and GeoFRED endpoints.
     ///
     /// The API key is checked for FRED's 32-character alphanumeric format.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, FredError> {
+    pub fn new(
+        api_key: impl Into<String>,
+        resilience: FredResilienceConfig,
+    ) -> Result<Self, FredError> {
         let api_key = api_key.into();
         if api_key.len() != 32 || !api_key.bytes().all(|c| c.is_ascii_alphanumeric()) {
             return Err(FredError::InvalidApiKey);
         }
-        Self::with_urls(api_key, FRED_BASE_URL, GEOFRED_BASE_URL)
+        Self::with_urls(api_key, FRED_BASE_URL, GEOFRED_BASE_URL, resilience)
     }
 
-    /// Creates a client against custom bases. Useful for tests and proxies.
     pub fn with_urls(
         api_key: impl Into<String>,
         fred_base: &str,
         geofred_base: &str,
+        resilience: FredResilienceConfig,
     ) -> Result<Self, FredError> {
+        let rate_limiter = RateLimiterState::new(resilience.requests_per_second);
         Ok(Self {
             http: Client::new(),
             api_key: api_key.into(),
             fred_base: Url::parse(fred_base)?,
             geofred_base: Url::parse(geofred_base)?,
+            resilience,
+            rate_limiter,
         })
     }
 
@@ -88,36 +173,127 @@ impl FredClient {
         endpoint: &str,
         query: Query,
     ) -> Result<T, FredError> {
-        let mut url = (if geo {
+        let series_id = query.0.get("series_id").cloned();
+        let query_parameter_count = query.0.len();
+        let base = if geo {
             &self.geofred_base
         } else {
             &self.fred_base
-        })
-        .join(endpoint)?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            pairs.append_pair("api_key", &self.api_key);
-            pairs.append_pair("file_type", "json");
-            for (key, value) in query.0 {
-                pairs.append_pair(&key, &value);
+        };
+        let url = build_url(base, endpoint, &self.api_key, query)?;
+
+        let max_attempts = self.resilience.max_retries + 1;
+        let mut backoff = self.resilience.initial_backoff;
+
+        for attempt in 1..=max_attempts {
+            tracing::trace!(
+                endpoint,
+                attempt,
+                series_id = series_id.as_deref().unwrap_or("<none>"),
+                query_parameter_count,
+                "preparing FRED HTTP request"
+            );
+
+            let rate_limit_started = Instant::now();
+            self.rate_limiter.wait_turn().await;
+            let rate_limit_wait = rate_limit_started.elapsed();
+            if rate_limit_wait > Duration::from_millis(1) {
+                tracing::debug!(
+                    endpoint,
+                    attempt,
+                    series_id = series_id.as_deref().unwrap_or("<none>"),
+                    wait_ms = rate_limit_wait.as_millis(),
+                    "waited for rate limiter"
+                );
             }
-        // drop(pairs);
-        }
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(FredError::Transport)?;
-        let status = response.status();
-        let body = response.text().await.map_err(FredError::Transport)?;
-        if !status.is_success() {
-            if let Ok(error) = serde_json::from_str::<FredApiError>(&body) {
-                return Err(FredError::Api(error));
+
+            tracing::debug!(
+                endpoint,
+                attempt,
+                series_id = series_id.as_deref().unwrap_or("<none>"),
+                "sending request to FRED"
+            );
+            let http_started = Instant::now();
+
+            match self.http.get(url.clone()).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = match response.text().await {
+                        Ok(body) => body,
+                        Err(error) => {
+                            tracing::debug!(
+                                endpoint,
+                                attempt,
+                                %status,
+                                elapsed_ms = http_started.elapsed().as_millis(),
+                                "response body could not be read"
+                            );
+                            return Err(FredError::Transport(error));
+                        }
+                    };
+                    tracing::debug!(
+                        endpoint,
+                        attempt,
+                        series_id = series_id.as_deref().unwrap_or("<none>"),
+                        %status,
+                        elapsed_ms = http_started.elapsed().as_millis(),
+                        response_body_bytes = body.len(),
+                        "response received"
+                    );
+
+                    // فقط خطاهای سمت سرور (۵xx) قابل retry هستن — ۴xx یعنی
+                    // درخواست خودمون اشتباهه، دوباره فرستادنش بی‌فایده‌ست.
+                    if status.is_server_error() && attempt < max_attempts {
+                        tracing::warn!(
+                            endpoint,
+                            attempt,
+                            max_attempts,
+                            %status,
+                            delay_ms = backoff.as_millis(),
+                            "server error, retrying"
+                        );
+                        tracing::debug!(
+                            endpoint,
+                            attempt,
+                            delay_ms = backoff.as_millis(),
+                            "retry delay"
+                        );
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(self.resilience.max_backoff);
+                        continue;
+                    }
+
+                    if !status.is_success() {
+                        if let Ok(error) = serde_json::from_str::<FredApiError>(&body) {
+                            return Err(FredError::Api(error));
+                        }
+                        return Err(FredError::Http { status, body });
+                    }
+
+                    return serde_json::from_str(&body).map_err(FredError::Decode);
+                }
+                Err(_) if attempt < max_attempts => {
+                    tracing::warn!(
+                        endpoint,
+                        attempt,
+                        max_attempts,
+                        delay_ms = backoff.as_millis(),
+                        "transport error, retrying"
+                    );
+                    tracing::debug!(
+                        endpoint,
+                        attempt,
+                        delay_ms = backoff.as_millis(),
+                        "retry delay"
+                    );
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(self.resilience.max_backoff);
+                }
+                Err(e) => return Err(FredError::Transport(e)),
             }
-            return Err(FredError::Http { status, body });
         }
-        serde_json::from_str(&body).map_err(FredError::Decode)
+
+        unreachable!("loop always returns before the final iteration completes without a result")
     }
 
     async fn collection<T: DeserializeOwned>(
@@ -152,6 +328,12 @@ pub enum FredError {
     EmptyResponse { resource: &'static str },
     #[error("the request queue is closed")]
     Unavailable(String),
+}
+
+impl From<keyring::Error> for FredError {
+    fn from(error: keyring::Error) -> Self {
+        FredError::Unavailable(error.to_string())
+    }
 }
 
 /// Error body returned by FRED for invalid API requests.
@@ -246,15 +428,15 @@ pub mod params {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum $name { $($variant),+ }
         impl $name { pub fn as_str(self) -> &'static str { match self { $(Self::$variant => $value),+ } } }
     }; }
-    
-    string_enum!(Frequency { 
-        Daily=>"d", 
-        Weekly=>"w", 
-        Biweekly=>"bw", 
-        Monthly=>"m", 
-        Quarterly=>"q", 
-        Semiannual=>"sa", 
-        Annual=>"a", 
+
+    string_enum!(Frequency {
+        Daily=>"d",
+        Weekly=>"w",
+        Biweekly=>"bw",
+        Monthly=>"m",
+        Quarterly=>"q",
+        Semiannual=>"sa",
+        Annual=>"a",
         WeeklyEndingFriday=>"wef",
         WeeklyEndingThursday=>"weth",
         WeeklyEndingWednesday=>"wew",
@@ -267,32 +449,32 @@ pub mod params {
     });
 
     string_enum!(AggregationMethod { Average=>"avg", Sum=>"sum", EndOfPeriod=>"eop" });
-    
-    string_enum!(Units { 
-        Levels=>"lin", 
-        Change=>"chg", 
-        ChangeFromYearAgo=>"ch1", 
-        PercentChange=>"pch", 
-        PercentChangeFromYearAgo=>"pc1", 
-        CompoundedAnnualRate=>"pca", 
-        ContinuouslyCompoundedChange=>"cch", 
-        ContinuouslyCompoundedAnnualRate=>"cca", 
-        NaturalLog=>"log" 
+
+    string_enum!(Units {
+        Levels=>"lin",
+        Change=>"chg",
+        ChangeFromYearAgo=>"ch1",
+        PercentChange=>"pch",
+        PercentChangeFromYearAgo=>"pc1",
+        CompoundedAnnualRate=>"pca",
+        ContinuouslyCompoundedChange=>"cch",
+        ContinuouslyCompoundedAnnualRate=>"cca",
+        NaturalLog=>"log"
     });
 
     string_enum!(Seasonality { SeasonallyAdjusted=>"sa", NotSeasonallyAdjusted=>"nsa", SeasonallyAdjustedAnnualRate=>"saar", NotSeasonallyAdjustedAnnualRate=>"nsaar" });
-    
+
     string_enum!(SortOrder { Ascending=>"asc", Descending=>"desc" });
-    
+
     string_enum!(OutputType {
         ObservationsByRealtimePeriod=>"1",
         ObservationsByVintageDateAll=>"2",
         ObservationsByVintageDateNewAndRevised=>"3",
         InitialReleaseOnly=>"4"
     });
-    
+
     string_enum!(SearchType { FullText=>"full_text", SeriesId=>"series_id" });
-    
+
     /// Parameters shared by most list endpoints.
     #[derive(Clone, Debug, Default)]
     pub struct Pagination {
@@ -500,7 +682,6 @@ impl<'a> SeriesApi<'a> {
             .observations)
     }
 
-
     /// Fetches observations across a wide realtime window, automatically splitting
     /// the request into vintage-safe sub-windows to stay under FRED's documented
     /// 2000-vintage-date limit per request. Yields one page per sub-window.
@@ -523,40 +704,81 @@ impl<'a> SeriesApi<'a> {
         // (9999-12-31) باشه. چون هیچ‌وقت داده‌ای بعد از امروز وجود نداره، کلمپ‌کردن
         // اینجا به "امروز" هیچ داده‌ای رو حذف نمی‌کنه — فقط از تولید پنجره‌های
         // نامعتبر (بین امروز و sentinel) جلوگیری می‌کنه.
-        let end = params
-            .realtime
-            .end
-            .unwrap_or(today)
-            .min(today);
+        let end = params.realtime.end.unwrap_or(today).min(today);
 
         let windows = split_realtime_window(start, end, window_years);
+        let total_windows = windows.len();
+        let series_id = params.series_id.clone();
 
-        stream::iter(windows).then(move |(window_start, window_end)| {
-            let mut p = params.clone();
-            p.realtime = Realtime {
-                start: Some(window_start),
-                end: Some(window_end),
-            };
-            async move {
-                match self.observations(p.clone()).await {
-                    Err(FredError::Api(ref e)) if is_no_vintage_data_before_window(e) => Ok(vec![]),
-                    Err(FredError::Api(ref e)) => match extract_servers_today_from_error(e) {
-                        Some(servers_today) => {
-                            let mut retry = p.clone();
-                            retry.realtime.end = Some(servers_today.min(window_end));
-                            match self.observations(retry).await {
-                                Err(FredError::Api(ref e2)) if is_no_vintage_data_before_window(e2) => Ok(vec![]),
-                                other => other,
-                            }
+        stream::iter(windows.into_iter().enumerate())
+            .map(move |(index, (window_start, window_end))| {
+                let mut p = params.clone();
+                p.realtime = Realtime {
+                    start: Some(window_start),
+                    end: Some(window_end),
+                };
+                let series_id = series_id.clone();
+                async move {
+                    let window = index + 1;
+                    let window_started = Instant::now();
+                    tracing::debug!(
+                        series_id,
+                        window,
+                        total_windows,
+                        window_start = %window_start,
+                        window_end = %window_end,
+                        "window started"
+                    );
+
+                    let result = match self.observations(p.clone()).await {
+                        Err(FredError::Api(ref e)) if is_no_vintage_data_before_window(e) => {
+                            Ok(vec![])
                         }
-                        None => Err(FredError::Api(e.clone())),
-                    },
-                    other => other,
-                }
-            }
-        })
-    }
+                        Err(FredError::Api(ref e)) => match extract_servers_today_from_error(e) {
+                            Some(servers_today) => {
+                                let mut retry = p.clone();
+                                retry.realtime.end = Some(servers_today.min(window_end));
+                                match self.observations(retry).await {
+                                    Err(FredError::Api(ref e2))
+                                        if is_no_vintage_data_before_window(e2) =>
+                                    {
+                                        Ok(vec![])
+                                    }
+                                    other => other,
+                                }
+                            }
+                            None => Err(FredError::Api(e.clone())),
+                        },
+                        other => other,
+                    };
 
+                    match &result {
+                        Ok(observations) => tracing::debug!(
+                            series_id,
+                            window,
+                            total_windows,
+                            window_start = %window_start,
+                            window_end = %window_end,
+                            observation_count = observations.len(),
+                            elapsed_ms = window_started.elapsed().as_millis(),
+                            "window completed"
+                        ),
+                        Err(_) => tracing::debug!(
+                            series_id,
+                            window,
+                            total_windows,
+                            window_start = %window_start,
+                            window_end = %window_end,
+                            elapsed_ms = window_started.elapsed().as_millis(),
+                            "window failed"
+                        ),
+                    }
+
+                    result
+                }
+            })
+            .buffered(WINDOW_CONCURRENCY)
+    }
 
     /// Searches the FRED series catalogue.
     pub async fn search(&self, p: Search) -> Result<Vec<Series>, FredError> {
@@ -573,43 +795,101 @@ impl<'a> SeriesApi<'a> {
         }
         Ok(self.0.get::<R>(false, "series/search", q).await?.seriess)
     }
-    pub async fn categories(&self, series_id: &str, window: Realtime) -> Result<Vec<Category>, FredError> {
-        let mut q = Query::default(); q.put("series_id", series_id); realtime(&mut q, &window);
-        self.0.collection(false, "series/categories", q, "categories").await
+    pub async fn categories(
+        &self,
+        series_id: &str,
+        window: Realtime,
+    ) -> Result<Vec<Category>, FredError> {
+        let mut q = Query::default();
+        q.put("series_id", series_id);
+        realtime(&mut q, &window);
+        self.0
+            .collection(false, "series/categories", q, "categories")
+            .await
     }
     pub async fn release(&self, series_id: &str, window: Realtime) -> Result<Release, FredError> {
-        let mut q = Query::default(); q.put("series_id", series_id); realtime(&mut q, &window);
-        self.0.collection(false, "series/release", q, "releases").await?.into_iter().next()
-            .ok_or(FredError::EmptyResponse { resource: "release" })
+        let mut q = Query::default();
+        q.put("series_id", series_id);
+        realtime(&mut q, &window);
+        self.0
+            .collection(false, "series/release", q, "releases")
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(FredError::EmptyResponse {
+                resource: "release",
+            })
     }
     pub async fn tags(&self, series_id: &str, window: Realtime) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("series_id", series_id); realtime(&mut q, &window);
+        let mut q = Query::default();
+        q.put("series_id", series_id);
+        realtime(&mut q, &window);
         self.0.collection(false, "series/tags", q, "tags").await
     }
     pub async fn search_tags(&self, p: Search) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("search_text", p.search_text);
-        if let Some(v) = p.search_type { q.put("search_type", v.as_str()) }
-        realtime(&mut q, &p.realtime); pagination(&mut q, &p.pagination);
-        self.0.collection(false, "series/search/tags", q, "tags").await
+        let mut q = Query::default();
+        q.put("search_text", p.search_text);
+        if let Some(v) = p.search_type {
+            q.put("search_type", v.as_str())
+        }
+        realtime(&mut q, &p.realtime);
+        pagination(&mut q, &p.pagination);
+        self.0
+            .collection(false, "series/search/tags", q, "tags")
+            .await
     }
-    pub async fn search_related_tags(&self, p: Search, tag_names: &str) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("search_text", p.search_text); q.put("tag_names", tag_names);
-        if let Some(v) = p.search_type { q.put("search_type", v.as_str()) }
-        realtime(&mut q, &p.realtime); pagination(&mut q, &p.pagination);
-        self.0.collection(false, "series/search/related_tags", q, "tags").await
+    pub async fn search_related_tags(
+        &self,
+        p: Search,
+        tag_names: &str,
+    ) -> Result<Vec<Tag>, FredError> {
+        let mut q = Query::default();
+        q.put("search_text", p.search_text);
+        q.put("tag_names", tag_names);
+        if let Some(v) = p.search_type {
+            q.put("search_type", v.as_str())
+        }
+        realtime(&mut q, &p.realtime);
+        pagination(&mut q, &p.pagination);
+        self.0
+            .collection(false, "series/search/related_tags", q, "tags")
+            .await
     }
     /// Fetches recently updated series. `filter_value` is FRED's `macro`, `regional`, or `all`.
-    pub async fn updates(&self, filter_value: Option<&str>, start_time: Option<&str>, end_time: Option<&str>, options: ListOptions) -> Result<Vec<Series>, FredError> {
+    pub async fn updates(
+        &self,
+        filter_value: Option<&str>,
+        start_time: Option<&str>,
+        end_time: Option<&str>,
+        options: ListOptions,
+    ) -> Result<Vec<Series>, FredError> {
         let mut q = Query::default();
-        if let Some(v) = filter_value { q.put("filter_value", v); }
-        if let Some(v) = start_time { q.put("start_time", v); }
-        if let Some(v) = end_time { q.put("end_time", v); }
+        if let Some(v) = filter_value {
+            q.put("filter_value", v);
+        }
+        if let Some(v) = start_time {
+            q.put("start_time", v);
+        }
+        if let Some(v) = end_time {
+            q.put("end_time", v);
+        }
         list_options(&mut q, &options);
-        self.0.collection(false, "series/updates", q, "seriess").await
+        self.0
+            .collection(false, "series/updates", q, "seriess")
+            .await
     }
-    pub async fn vintage_dates(&self, series_id: &str, window: Realtime) -> Result<Vec<NaiveDate>, FredError> {
-        let mut q = Query::default(); q.put("series_id", series_id); realtime(&mut q, &window);
-        #[derive(Deserialize)] struct R { vintage_dates: Vec<NaiveDate> }
+    pub async fn vintage_dates(
+        &self,
+        series_id: &str,
+        window: Realtime,
+    ) -> Result<Vec<NaiveDate>, FredError> {
+        let mut q = Query::default();
+        q.put("series_id", series_id);
+        realtime(&mut q, &window);
+        #[derive(Deserialize)]
+        struct R {
+            vintage_dates: Vec<NaiveDate>,
+        }
         Ok(self
             .0
             .get::<R>(false, "series/vintagedates", q)
@@ -650,31 +930,67 @@ impl<'a> CategoryApi<'a> {
             })
     }
     /// Fetches child categories of `category_id`.
-    pub async fn children(&self, category_id: u64, window: Realtime) -> Result<Vec<Category>, FredError> {
+    pub async fn children(
+        &self,
+        category_id: u64,
+        window: Realtime,
+    ) -> Result<Vec<Category>, FredError> {
         let mut q = Query::default();
         q.put("category_id", category_id);
         realtime(&mut q, &window);
-        self.0.collection(false, "category/children", q, "categories").await
+        self.0
+            .collection(false, "category/children", q, "categories")
+            .await
     }
     /// Fetches categories related to `category_id`.
-    pub async fn related(&self, category_id: u64, window: Realtime) -> Result<Vec<Category>, FredError> {
+    pub async fn related(
+        &self,
+        category_id: u64,
+        window: Realtime,
+    ) -> Result<Vec<Category>, FredError> {
         let mut q = Query::default();
         q.put("category_id", category_id);
         realtime(&mut q, &window);
-        self.0.collection(false, "category/related", q, "categories").await
+        self.0
+            .collection(false, "category/related", q, "categories")
+            .await
     }
     /// Fetches series assigned to a category. Use [`raw`](Self::raw) for advanced tag filters.
-    pub async fn series(&self, category_id: u64, options: ListOptions) -> Result<Vec<Series>, FredError> {
-        let mut q = Query::default(); q.put("category_id", category_id); list_options(&mut q, &options);
-        self.0.collection(false, "category/series", q, "seriess").await
+    pub async fn series(
+        &self,
+        category_id: u64,
+        options: ListOptions,
+    ) -> Result<Vec<Series>, FredError> {
+        let mut q = Query::default();
+        q.put("category_id", category_id);
+        list_options(&mut q, &options);
+        self.0
+            .collection(false, "category/series", q, "seriess")
+            .await
     }
-    pub async fn tags(&self, category_id: u64, options: ListOptions) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("category_id", category_id); list_options(&mut q, &options);
+    pub async fn tags(
+        &self,
+        category_id: u64,
+        options: ListOptions,
+    ) -> Result<Vec<Tag>, FredError> {
+        let mut q = Query::default();
+        q.put("category_id", category_id);
+        list_options(&mut q, &options);
         self.0.collection(false, "category/tags", q, "tags").await
     }
-    pub async fn related_tags(&self, category_id: u64, tag_names: &str, options: ListOptions) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("category_id", category_id); q.put("tag_names", tag_names); list_options(&mut q, &options);
-        self.0.collection(false, "category/related_tags", q, "tags").await
+    pub async fn related_tags(
+        &self,
+        category_id: u64,
+        tag_names: &str,
+        options: ListOptions,
+    ) -> Result<Vec<Tag>, FredError> {
+        let mut q = Query::default();
+        q.put("category_id", category_id);
+        q.put("tag_names", tag_names);
+        list_options(&mut q, &options);
+        self.0
+            .collection(false, "category/related_tags", q, "tags")
+            .await
     }
     pub async fn raw<T: DeserializeOwned>(
         &self,
@@ -689,44 +1005,106 @@ impl<'a> CategoryApi<'a> {
 impl<'a> ReleaseApi<'a> {
     /// Fetches all releases.
     pub async fn all(&self, options: ListOptions) -> Result<Vec<Release>, FredError> {
-        let mut q = Query::default(); list_options(&mut q, &options);
+        let mut q = Query::default();
+        list_options(&mut q, &options);
         self.0.collection(false, "releases", q, "releases").await
     }
     pub async fn get(&self, release_id: u64, window: Realtime) -> Result<Release, FredError> {
-        let mut q = Query::default(); q.put("release_id", release_id); realtime(&mut q, &window);
-        self.0.collection(false, "release", q, "releases").await?.into_iter().next()
-            .ok_or(FredError::EmptyResponse { resource: "release" })
+        let mut q = Query::default();
+        q.put("release_id", release_id);
+        realtime(&mut q, &window);
+        self.0
+            .collection(false, "release", q, "releases")
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(FredError::EmptyResponse {
+                resource: "release",
+            })
     }
-    pub async fn dates(&self, release_id: u64, options: ListOptions) -> Result<Vec<ReleaseDate>, FredError> {
-        let mut q = Query::default(); q.put("release_id", release_id); list_options(&mut q, &options);
-        self.0.collection(false, "release/dates", q, "release_dates").await
+    pub async fn dates(
+        &self,
+        release_id: u64,
+        options: ListOptions,
+    ) -> Result<Vec<ReleaseDate>, FredError> {
+        let mut q = Query::default();
+        q.put("release_id", release_id);
+        list_options(&mut q, &options);
+        self.0
+            .collection(false, "release/dates", q, "release_dates")
+            .await
     }
     /// Fetches release dates across all releases.
-    pub async fn all_dates(&self, include_without_data: bool, options: ListOptions) -> Result<Vec<ReleaseDate>, FredError> {
-        let mut q = Query::default(); q.put("include_release_dates_with_no_data", include_without_data); list_options(&mut q, &options);
-        self.0.collection(false, "releases/dates", q, "release_dates").await
+    pub async fn all_dates(
+        &self,
+        include_without_data: bool,
+        options: ListOptions,
+    ) -> Result<Vec<ReleaseDate>, FredError> {
+        let mut q = Query::default();
+        q.put("include_release_dates_with_no_data", include_without_data);
+        list_options(&mut q, &options);
+        self.0
+            .collection(false, "releases/dates", q, "release_dates")
+            .await
     }
-    pub async fn series(&self, release_id: u64, options: ListOptions) -> Result<Vec<Series>, FredError> {
-        let mut q = Query::default(); q.put("release_id", release_id); list_options(&mut q, &options);
-        self.0.collection(false, "release/series", q, "seriess").await
+    pub async fn series(
+        &self,
+        release_id: u64,
+        options: ListOptions,
+    ) -> Result<Vec<Series>, FredError> {
+        let mut q = Query::default();
+        q.put("release_id", release_id);
+        list_options(&mut q, &options);
+        self.0
+            .collection(false, "release/series", q, "seriess")
+            .await
     }
-    pub async fn sources(&self, release_id: u64, window: Realtime) -> Result<Vec<Source>, FredError> {
-        let mut q = Query::default(); q.put("release_id", release_id); realtime(&mut q, &window);
-        self.0.collection(false, "release/sources", q, "sources").await
+    pub async fn sources(
+        &self,
+        release_id: u64,
+        window: Realtime,
+    ) -> Result<Vec<Source>, FredError> {
+        let mut q = Query::default();
+        q.put("release_id", release_id);
+        realtime(&mut q, &window);
+        self.0
+            .collection(false, "release/sources", q, "sources")
+            .await
     }
     pub async fn tags(&self, release_id: u64, options: ListOptions) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("release_id", release_id); list_options(&mut q, &options);
+        let mut q = Query::default();
+        q.put("release_id", release_id);
+        list_options(&mut q, &options);
         self.0.collection(false, "release/tags", q, "tags").await
     }
-    pub async fn related_tags(&self, release_id: u64, tag_names: &str, options: ListOptions) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("release_id", release_id); q.put("tag_names", tag_names); list_options(&mut q, &options);
-        self.0.collection(false, "release/related_tags", q, "tags").await
+    pub async fn related_tags(
+        &self,
+        release_id: u64,
+        tag_names: &str,
+        options: ListOptions,
+    ) -> Result<Vec<Tag>, FredError> {
+        let mut q = Query::default();
+        q.put("release_id", release_id);
+        q.put("tag_names", tag_names);
+        list_options(&mut q, &options);
+        self.0
+            .collection(false, "release/related_tags", q, "tags")
+            .await
     }
     /// Fetches the hierarchical release table response. Its tree is represented as JSON because
     /// FRED's table elements are recursively shaped.
-    pub async fn tables(&self, release_id: u64, element_id: Option<u64>, include_observation_values: bool, observation_date: Option<NaiveDate>) -> Result<serde_json::Value, FredError> {
-        let mut q = Query::default(); q.put("release_id", release_id);
-        if let Some(id) = element_id { q.put("element_id", id); }
+    pub async fn tables(
+        &self,
+        release_id: u64,
+        element_id: Option<u64>,
+        include_observation_values: bool,
+        observation_date: Option<NaiveDate>,
+    ) -> Result<serde_json::Value, FredError> {
+        let mut q = Query::default();
+        q.put("release_id", release_id);
+        if let Some(id) = element_id {
+            q.put("element_id", id);
+        }
         q.put("include_observation_values", include_observation_values);
         q.date("observation_date", observation_date);
         self.0.get(false, "release/tables", q).await
@@ -741,17 +1119,32 @@ impl<'a> ReleaseApi<'a> {
 }
 impl<'a> SourceApi<'a> {
     pub async fn all(&self, options: ListOptions) -> Result<Vec<Source>, FredError> {
-        let mut q = Query::default(); list_options(&mut q, &options);
+        let mut q = Query::default();
+        list_options(&mut q, &options);
         self.0.collection(false, "sources", q, "sources").await
     }
     pub async fn get(&self, source_id: u64, window: Realtime) -> Result<Source, FredError> {
-        let mut q = Query::default(); q.put("source_id", source_id); realtime(&mut q, &window);
-        self.0.collection(false, "source", q, "sources").await?.into_iter().next()
+        let mut q = Query::default();
+        q.put("source_id", source_id);
+        realtime(&mut q, &window);
+        self.0
+            .collection(false, "source", q, "sources")
+            .await?
+            .into_iter()
+            .next()
             .ok_or(FredError::EmptyResponse { resource: "source" })
     }
-    pub async fn releases(&self, source_id: u64, options: ListOptions) -> Result<Vec<Release>, FredError> {
-        let mut q = Query::default(); q.put("source_id", source_id); list_options(&mut q, &options);
-        self.0.collection(false, "source/releases", q, "releases").await
+    pub async fn releases(
+        &self,
+        source_id: u64,
+        options: ListOptions,
+    ) -> Result<Vec<Release>, FredError> {
+        let mut q = Query::default();
+        q.put("source_id", source_id);
+        list_options(&mut q, &options);
+        self.0
+            .collection(false, "source/releases", q, "releases")
+            .await
     }
     pub async fn raw<T: DeserializeOwned>(
         &self,
@@ -763,15 +1156,28 @@ impl<'a> SourceApi<'a> {
 }
 impl<'a> TagsApi<'a> {
     pub async fn get(&self, options: ListOptions) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); list_options(&mut q, &options);
+        let mut q = Query::default();
+        list_options(&mut q, &options);
         self.0.collection(false, "tags", q, "tags").await
     }
-    pub async fn related(&self, tag_names: &str, options: ListOptions) -> Result<Vec<Tag>, FredError> {
-        let mut q = Query::default(); q.put("tag_names", tag_names); list_options(&mut q, &options);
+    pub async fn related(
+        &self,
+        tag_names: &str,
+        options: ListOptions,
+    ) -> Result<Vec<Tag>, FredError> {
+        let mut q = Query::default();
+        q.put("tag_names", tag_names);
+        list_options(&mut q, &options);
         self.0.collection(false, "related_tags", q, "tags").await
     }
-    pub async fn series(&self, tag_names: &str, options: ListOptions) -> Result<Vec<Series>, FredError> {
-        let mut q = Query::default(); q.put("tag_names", tag_names); list_options(&mut q, &options);
+    pub async fn series(
+        &self,
+        tag_names: &str,
+        options: ListOptions,
+    ) -> Result<Vec<Series>, FredError> {
+        let mut q = Query::default();
+        q.put("tag_names", tag_names);
+        list_options(&mut q, &options);
         self.0.collection(false, "tags/series", q, "seriess").await
     }
     pub async fn raw<T: DeserializeOwned>(
@@ -794,7 +1200,11 @@ impl<'a> GeoFredApi<'a> {
 
 /// Splits `[start, end]` into consecutive, non-overlapping sub-ranges of at most
 /// `years` years each. The last sub-range may be shorter.
-fn split_realtime_window(start: NaiveDate, end: NaiveDate, years: u32) -> Vec<(NaiveDate, NaiveDate)> {
+fn split_realtime_window(
+    start: NaiveDate,
+    end: NaiveDate,
+    years: u32,
+) -> Vec<(NaiveDate, NaiveDate)> {
     let years = years.max(1); // جلوگیری از حلقه‌ی بی‌نهایت اگه صفر پاس داده بشه
     let mut windows = Vec::new();
     let mut window_start = start;
@@ -824,7 +1234,6 @@ fn is_no_vintage_data_before_window(error: &FredApiError) -> bool {
             .contains("does not exist in ALFRED but may exist in FRED")
 }
 
-
 fn extract_servers_today_from_error(error: &FredApiError) -> Option<NaiveDate> {
     // پیغام همیشه به این شکله:
     // "... can not be after today's date (YYYY-MM-DD) unless ..."
@@ -834,14 +1243,27 @@ fn extract_servers_today_from_error(error: &FredApiError) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(&error.error_message[start..end], "%Y-%m-%d").ok()
 }
 
+fn build_url(base: &Url, endpoint: &str, api_key: &str, query: Query) -> Result<Url, FredError> {
+    let mut url = base.join(endpoint)?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("api_key", api_key);
+        pairs.append_pair("file_type", "json");
+        for (key, value) in query.0 {
+            pairs.append_pair(&key, &value);
+        }
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-use futures::pin_mut;
-use serde_json::Value;
+    use futures::pin_mut;
+    use serde_json::Value;
 
-use super::*;
+    use super::*;
     #[test]
     fn missing_observation_is_none() {
         let o:Observation=serde_json::from_str(r#"{"realtime_start":"2020-01-01","realtime_end":"2020-01-01","date":"2020-01-01","value":"."}"#).unwrap();
@@ -855,13 +1277,10 @@ use super::*;
 
     #[tokio::test]
     async fn inspect_fred_observation_dates() {
-        let api_key = keyring::Entry::new(
-        "macro-economics",
-        "FRED_API_KEY",
-        )
-        .unwrap()
-        .get_password()
-        .unwrap();
+        let api_key = keyring::Entry::new("macro-economics", "FRED_API_KEY")
+            .unwrap()
+            .get_password()
+            .unwrap();
 
         let url = "https://api.stlouisfed.org/fred/series/observations";
 
@@ -896,7 +1315,6 @@ use super::*;
         println!("realtime_end   = {:?}", observation["realtime_end"]);
     }
 
-
     #[tokio::test]
     async fn inspect_fred_all_revisions() {
         let api_key = keyring::Entry::new("macro-economics", "FRED_API_KEY")
@@ -918,9 +1336,9 @@ use super::*;
                     ("api_key", api_key.as_str()),
                     ("file_type", "json"),
                     ("series_id", "CPIAUCSL"),
-                    ("realtime_start", "1776-07-04"),  // FRED's "earliest" sentinel
-                    ("realtime_end", "9999-12-31"),     // FRED's "latest" sentinel
-                    ("output_type", "2"),               // all vintages, incl. revisions
+                    ("realtime_start", "1776-07-04"), // FRED's "earliest" sentinel
+                    ("realtime_end", "9999-12-31"),   // FRED's "latest" sentinel
+                    ("output_type", "2"),             // all vintages, incl. revisions
                     ("limit", &limit.to_string()),
                     ("offset", &offset.to_string()),
                 ])
@@ -943,7 +1361,10 @@ use super::*;
             offset += limit;
         }
 
-        println!("total rows (all obs dates, all revisions): {}", all_observations.len());
+        println!(
+            "total rows (all obs dates, all revisions): {}",
+            all_observations.len()
+        );
 
         // peek at a few
         for obs in all_observations.iter().take(5) {
@@ -976,7 +1397,7 @@ use super::*;
                     ("file_type", "json"),
                     ("series_id", "CPIAUCSL"),
                     ("realtime_start", "1776-07-04"), // widen real-time window
-                    ("realtime_end", "9999-12-31"),    // to catch every vintage
+                    ("realtime_end", "9999-12-31"),   // to catch every vintage
                     // no output_type -> defaults to 1 (flat, per-vintage rows)
                     // no observation_start/end -> defaults to full history
                     ("limit", &limit.to_string()),
@@ -993,7 +1414,10 @@ use super::*;
             let count = batch.len();
             all_observations.extend(batch);
 
-            println!("fetched {count} rows at offset {offset}, total count={}", json["count"]);
+            println!(
+                "fetched {count} rows at offset {offset}, total count={}",
+                json["count"]
+            );
 
             if count < limit as usize {
                 break;
@@ -1001,7 +1425,10 @@ use super::*;
             offset += limit;
         }
 
-        println!("total rows (all dates, all revisions): {}", all_observations.len());
+        println!(
+            "total rows (all dates, all revisions): {}",
+            all_observations.len()
+        );
 
         for obs in all_observations.iter().take(5) {
             println!(
@@ -1034,14 +1461,16 @@ use super::*;
         }
     }
 
-
     #[test]
     fn splits_into_non_overlapping_windows() {
         let start = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2012, 6, 15).unwrap();
         let windows = split_realtime_window(start, end, 5);
 
-        assert_eq!(windows[0], (start, NaiveDate::from_ymd_opt(2004, 12, 31).unwrap()));
+        assert_eq!(
+            windows[0],
+            (start, NaiveDate::from_ymd_opt(2004, 12, 31).unwrap())
+        );
         assert_eq!(windows[1].0, NaiveDate::from_ymd_opt(2005, 1, 1).unwrap());
         assert_eq!(*windows.last().unwrap(), (windows.last().unwrap().0, end));
 
@@ -1058,7 +1487,9 @@ use super::*;
             .get_password()
             .unwrap();
 
-        let client = FredClient::new(api_key).unwrap();
+        let fred_resilience_config = FredResilienceConfig::default();
+
+        let client = FredClient::new(api_key, fred_resilience_config).unwrap();
 
         let mut params = Observations::new("DGS10");
         params.realtime = Realtime {
@@ -1099,7 +1530,10 @@ use super::*;
             window_index > 1,
             "a huge date range should be split into multiple windows"
         );
-        assert!(total_observations > 0, "DGS10 should have real observations");
+        assert!(
+            total_observations > 0,
+            "DGS10 should have real observations"
+        );
     }
 
     #[test]
@@ -1122,5 +1556,4 @@ use super::*;
         };
         assert_eq!(extract_servers_today_from_error(&error), None);
     }
-
 }
