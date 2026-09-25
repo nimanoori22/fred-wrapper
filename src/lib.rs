@@ -17,7 +17,7 @@ use tokio::time::{Duration, Instant};
 use url::Url;
 use rustopus::{Arm, Backoff, Quota, TransportError};
 use rustopus::{Decision, Outcome, Policy, TransportErrorKind};
-use rustopus::reqwest::{self, Client, StatusCode};
+pub use rustopus::reqwest::{self, Client, StatusCode};
 
 
 /// The default FRED API base URL.
