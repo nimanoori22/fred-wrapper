@@ -7,18 +7,18 @@
 //! [FRED]: https://fred.stlouisfed.org/docs/api/fred/
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 use chrono::NaiveDate;
 use futures::stream::{self, Stream, StreamExt};
-use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant};
 use url::Url;
+use rustopus::{Arm, Backoff, Quota, TransportError};
+use rustopus::{Decision, Outcome, Policy, TransportErrorKind};
+use rustopus::reqwest::{self, Client, StatusCode};
 
-pub mod queue;
 
 /// The default FRED API base URL.
 pub const FRED_BASE_URL: &str = "https://api.stlouisfed.org/fred/";
@@ -27,20 +27,135 @@ pub const GEOFRED_BASE_URL: &str = "https://api.stlouisfed.org/geofred/";
 /// The number of concurrent requests to allow within each window.
 pub const WINDOW_CONCURRENCY: usize = 4;
 
+
+#[derive(Debug, Clone)]
+pub struct FredPolicy {
+    max_retry_after: Duration,
+    /// Total attempts allowed for a persistent 5xx before giving up early,
+    /// independent of the arm's overall `max_attempts`. `1` = no retry at
+    /// all; `2` = one shallow retry; etc.
+    max_server_error_attempts: u32,
+}
+
+impl FredPolicy {
+    pub fn new() -> Self {
+        Self {
+            max_retry_after: Duration::from_secs(60),
+            max_server_error_attempts: 2, // one retry, then give up
+        }
+    }
+
+    pub fn max_retry_after(mut self, max: Duration) -> Self {
+        self.max_retry_after = max;
+        self
+    }
+
+    /// Set to `1` to disable 5xx retries entirely, matching the earlier
+    /// fail-fast behavior.
+    pub fn max_server_error_attempts(mut self, n: u32) -> Self {
+        self.max_server_error_attempts = n.max(1);
+        self
+    }
+}
+
+impl Default for FredPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("HTTP {status}: {body}")]
+pub struct FredPolicyError {
+    pub status: StatusCode,
+    pub body: String,
+}
+
+impl Policy for FredPolicy {
+    type Error = FredPolicyError;
+
+    fn decide(
+        &self,
+        attempt: u32,
+        result: &Result<Outcome, TransportError>,
+    ) -> Decision<FredPolicyError> {
+        match result {
+            Err(e) => match e.kind() {
+                TransportErrorKind::Timeout
+                | TransportErrorKind::Connect
+                | TransportErrorKind::Body => Decision::Retry { after: None },
+                _ => Decision::Accept,
+            },
+
+            Ok(o) if o.status.is_success() => Decision::Accept,
+
+            // Rate limited: retry under the arm's normal max_attempts.
+            Ok(o) if o.status.as_u16() == 429 => {
+                Decision::Retry { after: self.retry_after(o) }
+            }
+
+            // Server error: a small, separate ceiling.
+            Ok(o) if o.status.is_server_error() => {
+                if attempt < self.max_server_error_attempts {
+                    tracing::warn!(
+                        status = %o.status,
+                        attempt,
+                        max_server_error_attempts = self.max_server_error_attempts,
+                        "FRED server error — retrying once"
+                    );
+                    Decision::Retry { after: None }
+                } else {
+                    let body = o.text_lossy();
+                    tracing::error!(
+                        status = %o.status,
+                        attempt,
+                        body = %body,
+                        "FRED server error — giving up, not retrying further"
+                    );
+                    Decision::Fail(FredPolicyError { status: o.status, body })
+                }
+            }
+
+            // Any other 4xx: the request itself is wrong; no point retrying.
+            Ok(o) => {
+                let body = o.text_lossy();
+                tracing::error!(
+                    status = %o.status,
+                    body = %body,
+                    "FRED rejected the request — not retrying"
+                );
+                Decision::Fail(FredPolicyError { status: o.status, body })
+            }
+        }
+    }
+}
+
+impl FredPolicy {
+    fn retry_after(&self, o: &Outcome) -> Option<Duration> {
+        let secs: u64 = o
+            .headers
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Duration::from_secs(secs).min(self.max_retry_after))
+    }
+}
+
+type FredArm = Arm<FredPolicy>;
+
 #[derive(Clone, Debug)]
 pub struct FredResilienceConfig {
-    /// Maximum number of request attempts allowed during each one-second window.
+    /// Requests per second (0 = unlimited).
     pub requests_per_second: u32,
-    /// Number of additional attempts after an initial failed request.
-    ///
-    /// For example, `max_retries: 2` permits at most three total attempts.
+    /// Additional attempts after the first; `2` means at most three attempts.
     pub max_retries: u32,
-    /// Delay before the first retry; later delays double, up to [`Self::max_backoff`].
     pub initial_backoff: Duration,
-    /// Upper bound for an exponential retry delay.
     pub max_backoff: Duration,
-    /// Longest time a request may wait for a rate-limit permit before it is rejected.
-    pub rate_limit_timeout: Duration,
+    /// Maximum requests in flight at once across all clones of the client.
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for FredResilienceConfig {
@@ -50,42 +165,8 @@ impl Default for FredResilienceConfig {
             max_retries: 3,
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(10),
-            rate_limit_timeout: Duration::from_millis(300),
+            max_concurrent_requests: WINDOW_CONCURRENCY,
         }
-    }
-}
-
-/// Ensures at most `requests_per_second` HTTP requests are sent, across all
-/// clones of the `FredClient` that share this state (via `Arc`).
-#[derive(Clone)]
-struct RateLimiterState {
-    last_request: Arc<AsyncMutex<Instant>>,
-    min_interval: Duration,
-}
-
-impl RateLimiterState {
-    fn new(requests_per_second: u32) -> Self {
-        let min_interval = if requests_per_second == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(1.0 / requests_per_second as f64)
-        };
-        Self {
-            last_request: Arc::new(AsyncMutex::new(Instant::now() - min_interval)),
-            min_interval,
-        }
-    }
-
-    /// Blocks until enough time has passed since the last request to stay
-    /// under the configured rate.
-    async fn wait_turn(&self) {
-        let mut last = self.last_request.lock().await;
-        let now = Instant::now();
-        let earliest_next = *last + self.min_interval;
-        if earliest_next > now {
-            sleep(earliest_next - now).await;
-        }
-        *last = Instant::now();
     }
 }
 
@@ -93,11 +174,10 @@ impl RateLimiterState {
 #[derive(Clone)]
 pub struct FredClient {
     http: reqwest::Client,
+    arm: FredArm,
     api_key: String,
     fred_base: Url,
     geofred_base: Url,
-    resilience: FredResilienceConfig,
-    rate_limiter: RateLimiterState,
 }
 
 impl std::fmt::Debug for FredClient {
@@ -111,9 +191,8 @@ impl std::fmt::Debug for FredClient {
 }
 
 impl FredClient {
-    /// Creates a client with the production FRED and GeoFRED endpoints.
-    ///
-    /// The API key is checked for FRED's 32-character alphanumeric format.
+    /// Creates a client with the production FRED and GeoFRED endpoints,
+    /// using a default `reqwest::Client` (proxy-aware, per environment variables).
     pub fn new(
         api_key: impl Into<String>,
         resilience: FredResilienceConfig,
@@ -125,20 +204,47 @@ impl FredClient {
         Self::with_urls(api_key, FRED_BASE_URL, GEOFRED_BASE_URL, resilience)
     }
 
+    /// Like [`new`](Self::new), but with custom FRED/GeoFRED base URLs
+    /// (useful for pointing at a mock server in tests).
     pub fn with_urls(
         api_key: impl Into<String>,
         fred_base: &str,
         geofred_base: &str,
         resilience: FredResilienceConfig,
     ) -> Result<Self, FredError> {
-        let rate_limiter = RateLimiterState::new(resilience.requests_per_second);
+        let http = Client::new();
+        Self::with_client(http, api_key, fred_base, geofred_base, resilience)
+    }
+
+    /// Like [`with_urls`](Self::with_urls), but lets the caller supply their
+    /// own `reqwest::Client` — e.g. one built with `.no_proxy()`, custom
+    /// timeouts, or a preconfigured proxy.
+    pub fn with_client(
+        http: reqwest::Client,
+        api_key: impl Into<String>,
+        fred_base: &str,
+        geofred_base: &str,
+        resilience: FredResilienceConfig,
+    ) -> Result<Self, FredError> {
+        let api_key = api_key.into();
+
+        let mut arm = Arm::builder()
+            .name("fred")
+            .policy(FredPolicy::new())
+            .suckers(resilience.max_concurrent_requests)
+            .max_attempts(resilience.max_retries + 1)
+            .backoff(Backoff::exponential(resilience.initial_backoff).cap(resilience.max_backoff));
+
+        if let Some(n) = NonZeroU32::new(resilience.requests_per_second) {
+            arm = arm.rate(Quota::per_second(n).allow_burst(NonZeroU32::MIN));
+        }
+
         Ok(Self {
-            http: Client::new(),
-            api_key: api_key.into(),
+            arm: arm.build(http.clone()),
+            http,
+            api_key,
             fred_base: Url::parse(fred_base)?,
             geofred_base: Url::parse(geofred_base)?,
-            resilience,
-            rate_limiter,
         })
     }
 
@@ -174,126 +280,33 @@ impl FredClient {
         query: Query,
     ) -> Result<T, FredError> {
         let series_id = query.0.get("series_id").cloned();
-        let query_parameter_count = query.0.len();
-        let base = if geo {
-            &self.geofred_base
-        } else {
-            &self.fred_base
-        };
+        let base = if geo { &self.geofred_base } else { &self.fred_base };
         let url = build_url(base, endpoint, &self.api_key, query)?;
+        let request = self
+            .http
+            .get(url)
+            .build()
+            .map_err(|e| FredError::Transport(e.into()))?;
 
-        let max_attempts = self.resilience.max_retries + 1;
-        let mut backoff = self.resilience.initial_backoff;
+        tracing::debug!(
+            endpoint,
+            series_id = series_id.as_deref().unwrap_or("<none>"),
+            "sending request to FRED"
+        );
+        let started = Instant::now();
 
-        for attempt in 1..=max_attempts {
-            tracing::trace!(
-                endpoint,
-                attempt,
-                series_id = series_id.as_deref().unwrap_or("<none>"),
-                query_parameter_count,
-                "preparing FRED HTTP request"
-            );
+        let outcome = self.arm.send(request).await.map_err(map_arm_error)?;
 
-            let rate_limit_started = Instant::now();
-            self.rate_limiter.wait_turn().await;
-            let rate_limit_wait = rate_limit_started.elapsed();
-            if rate_limit_wait > Duration::from_millis(1) {
-                tracing::debug!(
-                    endpoint,
-                    attempt,
-                    series_id = series_id.as_deref().unwrap_or("<none>"),
-                    wait_ms = rate_limit_wait.as_millis(),
-                    "waited for rate limiter"
-                );
-            }
+        tracing::debug!(
+            endpoint,
+            series_id = series_id.as_deref().unwrap_or("<none>"),
+            status = %outcome.status,
+            elapsed_ms = started.elapsed().as_millis(),
+            response_body_bytes = outcome.body.len(),
+            "response received"
+        );
 
-            tracing::debug!(
-                endpoint,
-                attempt,
-                series_id = series_id.as_deref().unwrap_or("<none>"),
-                "sending request to FRED"
-            );
-            let http_started = Instant::now();
-
-            match self.http.get(url.clone()).send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    let body = match response.text().await {
-                        Ok(body) => body,
-                        Err(error) => {
-                            tracing::debug!(
-                                endpoint,
-                                attempt,
-                                %status,
-                                elapsed_ms = http_started.elapsed().as_millis(),
-                                "response body could not be read"
-                            );
-                            return Err(FredError::Transport(error));
-                        }
-                    };
-                    tracing::debug!(
-                        endpoint,
-                        attempt,
-                        series_id = series_id.as_deref().unwrap_or("<none>"),
-                        %status,
-                        elapsed_ms = http_started.elapsed().as_millis(),
-                        response_body_bytes = body.len(),
-                        "response received"
-                    );
-
-                    // فقط خطاهای سمت سرور (۵xx) قابل retry هستن — ۴xx یعنی
-                    // درخواست خودمون اشتباهه، دوباره فرستادنش بی‌فایده‌ست.
-                    if status.is_server_error() && attempt < max_attempts {
-                        tracing::warn!(
-                            endpoint,
-                            attempt,
-                            max_attempts,
-                            %status,
-                            delay_ms = backoff.as_millis(),
-                            "server error, retrying"
-                        );
-                        tracing::debug!(
-                            endpoint,
-                            attempt,
-                            delay_ms = backoff.as_millis(),
-                            "retry delay"
-                        );
-                        sleep(backoff).await;
-                        backoff = (backoff * 2).min(self.resilience.max_backoff);
-                        continue;
-                    }
-
-                    if !status.is_success() {
-                        if let Ok(error) = serde_json::from_str::<FredApiError>(&body) {
-                            return Err(FredError::Api(error));
-                        }
-                        return Err(FredError::Http { status, body });
-                    }
-
-                    return serde_json::from_str(&body).map_err(FredError::Decode);
-                }
-                Err(_) if attempt < max_attempts => {
-                    tracing::warn!(
-                        endpoint,
-                        attempt,
-                        max_attempts,
-                        delay_ms = backoff.as_millis(),
-                        "transport error, retrying"
-                    );
-                    tracing::debug!(
-                        endpoint,
-                        attempt,
-                        delay_ms = backoff.as_millis(),
-                        "retry delay"
-                    );
-                    sleep(backoff).await;
-                    backoff = (backoff * 2).min(self.resilience.max_backoff);
-                }
-                Err(e) => return Err(FredError::Transport(e)),
-            }
-        }
-
-        unreachable!("loop always returns before the final iteration completes without a result")
+        serde_json::from_slice(&outcome.body).map_err(FredError::Decode)
     }
 
     async fn collection<T: DeserializeOwned>(
@@ -317,7 +330,7 @@ pub enum FredError {
     #[error("invalid API URL: {0}")]
     Url(#[from] url::ParseError),
     #[error("HTTP transport failed: {0}")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] TransportError),   // was reqwest::Error
     #[error("FRED API error: {0:?}")]
     Api(FredApiError),
     #[error("FRED returned HTTP {status}: {body}")]
@@ -326,8 +339,34 @@ pub enum FredError {
     Decode(#[source] serde_json::Error),
     #[error("FRED returned no {resource} records for a request that requires one")]
     EmptyResponse { resource: &'static str },
-    #[error("the request queue is closed")]
-    Unavailable(String),
+    #[error("total request deadline exceeded")]
+    Deadline,
+    #[error("request unavailable: {0}")]
+    Unavailable(String),                    // keyring errors + unknown rustopus errors
+}
+
+fn map_arm_error(e: rustopus::Error<FredPolicyError>) -> FredError {
+    use rustopus::Error as E;
+    match e {
+        E::Policy(FredPolicyError { status, body }) => status_error(status, body.as_bytes()),
+
+        E::Transport(t) => FredError::Transport(t),
+
+        E::Exhausted { attempts, last } => {
+            tracing::error!(attempts, "FRED request gave up after exhausting all retries");
+            match *last {
+                Ok(o) => status_error(o.status, &o.body),
+                Err(t) => FredError::Transport(t),
+            }
+        }
+
+        E::Deadline => {
+            tracing::error!("FRED request hit its total deadline");
+            FredError::Deadline
+        }
+
+        other => FredError::Unavailable(other.to_string()),
+    }
 }
 
 impl From<keyring::Error> for FredError {
@@ -1256,6 +1295,13 @@ fn build_url(base: &Url, endpoint: &str, api_key: &str, query: Query) -> Result<
     Ok(url)
 }
 
+fn status_error(status: StatusCode, body: &[u8]) -> FredError {
+    if let Ok(error) = serde_json::from_slice::<FredApiError>(body) {
+        return FredError::Api(error);
+    }
+    FredError::Http { status, body: String::from_utf8_lossy(body).into_owned() }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1284,7 +1330,10 @@ mod tests {
 
         let url = "https://api.stlouisfed.org/fred/series/observations";
 
-        let response = Client::new()
+        let response = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(url)
             .query(&[
                 ("api_key", api_key.as_str()),
@@ -1323,7 +1372,7 @@ mod tests {
             .unwrap();
 
         let url = "https://api.stlouisfed.org/fred/series/observations";
-        let client = Client::new();
+        let client = Client::builder().no_proxy().build().unwrap();
 
         let mut offset = 0u64;
         let limit = 100_000u64; // FRED's max per request
@@ -1383,7 +1432,7 @@ mod tests {
             .unwrap();
 
         let url = "https://api.stlouisfed.org/fred/series/observations";
-        let client = Client::new();
+        let client = Client::builder().no_proxy().build().unwrap();
 
         let mut offset = 0u64;
         let limit = 100_000u64; // FRED's max per request
@@ -1489,7 +1538,20 @@ mod tests {
 
         let fred_resilience_config = FredResilienceConfig::default();
 
-        let client = FredClient::new(api_key, fred_resilience_config).unwrap();
+        let http = Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| FredError::Transport(e.into()))
+            .unwrap();
+
+        let client = FredClient::with_client(
+            http,
+            api_key,
+            FRED_BASE_URL,
+            GEOFRED_BASE_URL,
+            fred_resilience_config,
+        )
+        .unwrap();
 
         let mut params = Observations::new("DGS10");
         params.realtime = Realtime {
@@ -1555,5 +1617,41 @@ mod tests {
             error_message: "Bad Request. Some other error.".to_string(),
         };
         assert_eq!(extract_servers_today_from_error(&error), None);
+    }
+}
+
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use rustopus::TransportError;
+    use bytes::Bytes;
+    use http::HeaderMap;
+
+    fn outcome(status: u16) -> Result<Outcome, TransportError> {
+        Ok(Outcome {
+            status: StatusCode::from_u16(status).unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"body"),
+        })
+    }
+
+    #[test]
+    fn retries_429() {
+        let p = FredPolicy::new();
+        assert!(matches!(p.decide(1, &outcome(429)), Decision::Retry { .. }));
+    }
+
+    #[test]
+    fn retries_500_once_then_fails() {
+        let p = FredPolicy::new(); // max_server_error_attempts: 2
+        assert!(matches!(p.decide(1, &outcome(500)), Decision::Retry { .. }));
+        assert!(matches!(p.decide(2, &outcome(500)), Decision::Fail(_)));
+    }
+
+    #[test]
+    fn zero_server_error_retries_fails_fast() {
+        let p = FredPolicy::new().max_server_error_attempts(1);
+        assert!(matches!(p.decide(1, &outcome(500)), Decision::Fail(_)));
     }
 }
